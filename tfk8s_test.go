@@ -5,7 +5,91 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	cty "github.com/zclconf/go-cty/cty"
 )
+
+func TestStripNullFields(t *testing.T) {
+	input := cty.ObjectVal(map[string]cty.Value{
+		"kind": cty.StringVal("Deployment"),
+		"metadata": cty.ObjectVal(map[string]cty.Value{
+			"name": cty.StringVal("test"),
+		}),
+		"spec": cty.ObjectVal(map[string]cty.Value{
+			"replicas": cty.NumberIntVal(1),
+			"affinity": cty.ObjectVal(map[string]cty.Value{
+				"nodeAffinity": cty.ObjectVal(map[string]cty.Value{
+					"requiredDuringSchedulingIgnoredDuringExecution":  cty.NullVal(cty.DynamicPseudoType),
+					"preferredDuringSchedulingIgnoredDuringExecution": cty.NullVal(cty.DynamicPseudoType),
+				}),
+			}),
+			"nullField": cty.NullVal(cty.String),
+		}),
+	})
+
+	expected := cty.ObjectVal(map[string]cty.Value{
+		"kind": cty.StringVal("Deployment"),
+		"metadata": cty.ObjectVal(map[string]cty.Value{
+			"name": cty.StringVal("test"),
+		}),
+		"spec": cty.ObjectVal(map[string]cty.Value{
+			"replicas": cty.NumberIntVal(1),
+			"affinity": cty.ObjectVal(map[string]cty.Value{
+				"nodeAffinity": cty.ObjectVal(map[string]cty.Value{}),
+			}),
+		}),
+	})
+
+	// Test stripNullFields
+	result := stripNullFields(input)
+	if !result.Equals(expected).True() {
+		t.Errorf("stripNullFields: got %+v, want %+v", result, expected)
+	}
+}
+
+func TestYAMLToHCLStripNull(t *testing.T) {
+	yamlInput := `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+ name: test
+spec:
+ replicas: 1
+ affinity:
+  nodeAffinity:
+   requiredDuringSchedulingIgnoredDuringExecution: null
+   preferredDuringSchedulingIgnoredDuringExecution: null
+ nullField: null
+`
+	r := strings.NewReader(yamlInput)
+	output, err := YAMLToTerraformResources(r, "", false, true, false, false)
+	if err != nil {
+		t.Fatalf("YAMLToTerraformResources: %v", err)
+	}
+
+	if strings.Contains(output, "requiredDuringSchedulingIgnoredDuringExecution") ||
+		strings.Contains(output, "preferredDuringSchedulingIgnoredDuringExecution") ||
+		strings.Contains(output, "nullField") {
+		t.Errorf("HCL contains null fields: %s", output)
+	}
+
+	expected := `
+resource "kubernetes_manifest" "deployment_test" {
+  manifest = {
+    "apiVersion" = "apps/v1"
+    "kind" = "Deployment"
+    "metadata" = {
+      "name" = "test"
+    }
+    "spec" = {
+      "affinity" = {
+        "nodeAffinity" = {}
+      }
+      "replicas" = 1
+    }
+  }
+}`
+	assert.Equal(t, strings.TrimSpace(expected), strings.TrimSpace(output))
+}
 
 func TestYAMLToTerraformResourcesSingle(t *testing.T) {
 	yaml := `---
@@ -17,8 +101,7 @@ data:
   TEST: test`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", false, false, false)
-
+	output, err := YAMLToTerraformResources(r, "", false, false, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
@@ -50,8 +133,7 @@ data:
   TEST: test`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", false, false, false)
-
+	output, err := YAMLToTerraformResources(r, "", false, false, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
@@ -85,8 +167,7 @@ data:
     echo "\${SHELL_ESCAPE${TF_ESCAPE}}"`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", false, false, false)
-
+	output, err := YAMLToTerraformResources(r, "", false, false, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
@@ -133,8 +214,7 @@ data:
   TEST: two`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", false, false, false)
-
+	output, err := YAMLToTerraformResources(r, "", false, false, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
@@ -196,8 +276,7 @@ items:
 `
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", false, false, false)
-
+	output, err := YAMLToTerraformResources(r, "", false, false, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
@@ -256,8 +335,7 @@ data:
   TEST: test`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "kubernetes-alpha", false, false, false)
-
+	output, err := YAMLToTerraformResources(r, "kubernetes-alpha", false, false, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
@@ -302,8 +380,7 @@ metadata:
   - test`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", true, false, false)
-
+	output, err := YAMLToTerraformResources(r, "", true, false, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
@@ -339,23 +416,24 @@ metadata:
   uid: bea6500b-0637-4d2d-b726-e0bda0b595dd`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", true, true, false)
-
+	output, err := YAMLToTerraformResources(r, "", true, true, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
 
-	expected := `{
-  "apiVersion" = "v1"
-  "data" = {
-    "TEST" = "test"
-  }
-  "kind" = "ConfigMap"
-  "metadata" = {
-    "name" = "test"
+	expected := `
+resource "kubernetes_manifest" "configmap_test" {
+  manifest = {
+    "apiVersion" = "v1"
+    "data" = {
+      "TEST" = "test"
+    }
+    "kind" = "ConfigMap"
+    "metadata" = {
+      "name" = "test"
+    }
   }
 }`
-
 	assert.Equal(t, strings.TrimSpace(expected), strings.TrimSpace(output))
 }
 
@@ -386,8 +464,7 @@ metadata:
   uid: bea6500b-0637-4d2d-b726-e0bda0b595dd`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", true, false, false)
-
+	output, err := YAMLToTerraformResources(r, "", true, false, false, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}

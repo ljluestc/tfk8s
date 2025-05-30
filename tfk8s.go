@@ -25,8 +25,6 @@ var toolVersion string
 // resourceType is the type of Terraform resource
 var resourceType = "kubernetes_manifest"
 
-// ignoreMetadata is the list of metadata fields to strip
-// when --strip is supplied
 var ignoreMetadata = []string{
 	"creationTimestamp",
 	"resourceVersion",
@@ -34,21 +32,53 @@ var ignoreMetadata = []string{
 	"uid",
 	"managedFields",
 	"finalizers",
-        "generation",
+	"generation",
 }
 
-// ignoreAnnotations is the list of annotations to strip
-// when --strip is supplied
 var ignoreAnnotations = []string{
 	"kubectl.kubernetes.io/last-applied-configuration",
 }
 
-// stripServerSideFields removes fields that have been added on the
-// server side after the resource was created such as the status field
-func stripServerSideFields(doc cty.Value) cty.Value {
+var yamlSeparator = "\n---"
+
+func stripNullFields(val cty.Value) cty.Value {
+	if val.IsNull() {
+		return val
+	}
+
+	if val.Type().IsObjectType() || val.Type().IsMapType() {
+		m := val.AsValueMap()
+		newMap := make(map[string]cty.Value)
+		for k, v := range m {
+			if !v.IsNull() {
+				newMap[k] = stripNullFields(v)
+			}
+		}
+		return cty.ObjectVal(newMap)
+	}
+
+	if val.Type().IsListType() || val.Type().IsSetType() || val.Type().IsTupleType() {
+		slice := val.AsValueSlice()
+		newSlice := make([]cty.Value, 0, len(slice))
+		for _, v := range slice {
+			if !v.IsNull() {
+				newSlice = append(newSlice, stripNullFields(v))
+			}
+		}
+		if len(newSlice) == 0 {
+			return cty.ListValEmpty(val.Type().ElementType())
+		}
+		return cty.ListVal(newSlice)
+	}
+
+	return val
+}
+
+// stripServerSideFields removes server-side fields and optionally null fields
+func stripServerSideFields(doc cty.Value, stripNull bool) cty.Value {
 	m := doc.AsValueMap()
 
-	// strip server-side metadata
+	// Strip server-side metadata
 	metadata := m["metadata"].AsValueMap()
 	for _, f := range ignoreMetadata {
 		delete(metadata, f)
@@ -69,15 +99,20 @@ func stripServerSideFields(doc cty.Value) cty.Value {
 	}
 	m["metadata"] = cty.ObjectVal(metadata)
 
-	// strip finalizer from spec
+	// Strip finalizer from spec
 	if v, ok := m["spec"]; ok {
 		mm := v.AsValueMap()
 		delete(mm, "finalizers")
 		m["spec"] = cty.ObjectVal(mm)
 	}
 
-	// strip status field
+	// Strip status field
 	delete(m, "status")
+
+	// Strip null fields if requested
+	if stripNull {
+		return stripNullFields(cty.ObjectVal(m))
+	}
 
 	return cty.ObjectVal(m)
 }
@@ -88,16 +123,16 @@ func snakify(s string) string {
 	return strings.ToLower(re.ReplaceAllString(s, "_"))
 }
 
-// escape incidences of ${} with $${} to prevent Terraform trying to interpolate them
+// escapeShellVars converts "${}" to "$${}" to prevent Terraform interpolation
 func escapeShellVars(s string) string {
 	r := regexp.MustCompile(`(\${.*?)`)
 	return r.ReplaceAllString(s, `$$$1`)
 }
 
-// yamlToHCL converts a single YAML document Terraform HCL
+// yamlToHCL converts a single YAML document to Terraform HCL
 func yamlToHCL(
 	doc cty.Value, providerAlias string,
-	stripServerSide bool, mapOnly bool, stripKeyQuotes bool) (string, error) {
+	stripServerSide bool, stripNull bool, mapOnly bool, stripKeyQuotes bool) (string, error) {
 	m := doc.AsValueMap()
 	docs := []cty.Value{doc}
 	if strings.HasSuffix(m["kind"].AsString(), "List") {
@@ -131,8 +166,8 @@ func yamlToHCL(
 		resourceName = resourceName + "_" + name
 		resourceName = snakify(resourceName)
 
-		if stripServerSide {
-			doc = stripServerSideFields(doc)
+		if stripServerSide || stripNull {
+			doc = stripServerSideFields(doc, stripNull)
 		}
 		s := terraform.FormatValue(doc, 0, stripKeyQuotes)
 		s = escapeShellVars(s)
@@ -155,15 +190,10 @@ func yamlToHCL(
 	return hcl, nil
 }
 
-var yamlSeparator = "\n---"
-
-// YAMLToTerraformResources takes a file containing one or more Kubernetes configs
-// and converts it to resources that can be used by the Terraform Kubernetes Provider
-//
-// FIXME this function has too many arguments now, use functional options instead
+// YAMLToTerraformResources converts YAML input to Terraform resources
 func YAMLToTerraformResources(
 	r io.Reader, providerAlias string, stripServerSide bool,
-	mapOnly bool, stripKeyQuotes bool) (string, error) {
+	stripNull bool, mapOnly bool, stripKeyQuotes bool) (string, error) {
 	hcl := ""
 
 	buf := bytes.Buffer{}
@@ -177,7 +207,6 @@ func YAMLToTerraformResources(
 	docs := strings.Split(manifest, yamlSeparator)
 	for _, doc := range docs {
 		if strings.TrimSpace(doc) == "" {
-			// some manifests have empty documents
 			continue
 		}
 
@@ -198,7 +227,6 @@ func YAMLToTerraformResources(
 		}
 
 		if doc.IsNull() {
-			// skip empty YAML docs
 			continue
 		}
 
@@ -206,7 +234,7 @@ func YAMLToTerraformResources(
 			return "", fmt.Errorf("the manifest must be a YAML document")
 		}
 
-		formatted, err := yamlToHCL(doc, providerAlias, stripServerSide, mapOnly, stripKeyQuotes)
+		formatted, err := yamlToHCL(doc, providerAlias, stripServerSide, stripNull, mapOnly, stripKeyQuotes)
 		if err != nil {
 			return "", fmt.Errorf("error converting YAML to HCL: %s", err)
 		}
@@ -241,10 +269,11 @@ func main() {
 	infile := flag.StringP("file", "f", "-", "Input file containing Kubernetes YAML manifests")
 	outfile := flag.StringP("output", "o", "-", "Output file to write Terraform config")
 	providerAlias := flag.StringP("provider", "p", "", "Provider alias to populate the `provider` attribute")
-	stripServerSide := flag.BoolP("strip", "s", false, "Strip out server side fields - use if you are piping from kubectl get")
-	version := flag.BoolP("version", "V", false, "Show tool version")
+	stripServerSide := flag.BoolP("strip", "s", false, "Strip out server-side fields")
+	stripNull := flag.BoolP("strip-null", "n", false, "Strip out fields with null values")
 	mapOnly := flag.BoolP("map-only", "M", false, "Output only an HCL map structure")
-	stripKeyQuotes := flag.BoolP("strip-key-quotes", "Q", false, "Strip out quotes from HCL map keys unless they are required.")
+	stripKeyQuotes := flag.BoolP("strip-key-quotes", "Q", false, "Strip out quotes from HCL map keys unless required")
+	version := flag.BoolP("version", "V", false, "Show tool version")
 	flag.Parse()
 
 	if *version {
@@ -262,10 +291,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %s\r\n", err.Error())
 			os.Exit(1)
 		}
+		defer file.Close()
 	}
 
-	hcl, err := YAMLToTerraformResources(
-		file, *providerAlias, *stripServerSide, *mapOnly, *stripKeyQuotes)
+	hcl, err := YAMLToTerraformResources(file, *providerAlias, *stripServerSide, *stripNull, *mapOnly, *stripKeyQuotes)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\r\n", err.Error())
 		os.Exit(1)
