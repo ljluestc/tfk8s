@@ -41,11 +41,8 @@ var ignoreAnnotations = []string{
 
 var yamlSeparator = "\n---"
 
+// stripNullFields removes any field that is null
 func stripNullFields(val cty.Value) cty.Value {
-	if val.IsNull() {
-		return val
-	}
-
 	if val.Type().IsObjectType() || val.Type().IsMapType() {
 		m := val.AsValueMap()
 		newMap := make(map[string]cty.Value)
@@ -59,14 +56,11 @@ func stripNullFields(val cty.Value) cty.Value {
 
 	if val.Type().IsListType() || val.Type().IsSetType() || val.Type().IsTupleType() {
 		slice := val.AsValueSlice()
-		newSlice := make([]cty.Value, 0, len(slice))
+		newSlice := make([]cty.Value, 0)
 		for _, v := range slice {
 			if !v.IsNull() {
 				newSlice = append(newSlice, stripNullFields(v))
 			}
-		}
-		if len(newSlice) == 0 {
-			return cty.ListValEmpty(val.Type().ElementType())
 		}
 		return cty.ListVal(newSlice)
 	}
@@ -132,7 +126,8 @@ func escapeShellVars(s string) string {
 // yamlToHCL converts a single YAML document to Terraform HCL
 func yamlToHCL(
 	doc cty.Value, providerAlias string,
-	stripServerSide bool, stripNull bool, mapOnly bool, stripKeyQuotes bool) (string, error) {
+	stripServerSide bool, stripNull bool, mapOnly bool, stripKeyQuotes bool,
+) (string, error) {
 	m := doc.AsValueMap()
 	docs := []cty.Value{doc}
 	if strings.HasSuffix(m["kind"].AsString(), "List") {
@@ -193,7 +188,8 @@ func yamlToHCL(
 // YAMLToTerraformResources converts YAML input to Terraform resources
 func YAMLToTerraformResources(
 	r io.Reader, providerAlias string, stripServerSide bool,
-	stripNull bool, mapOnly bool, stripKeyQuotes bool) (string, error) {
+	stripNull bool, mapOnly bool, stripKeyQuotes bool,
+) (string, error) {
 	hcl := ""
 
 	buf := bytes.Buffer{}
@@ -303,7 +299,7 @@ func main() {
 	if *outfile == "-" {
 		fmt.Print(hcl)
 	} else {
-		err := os.WriteFile(*outfile, []byte(hcl), 0644)
+		err := os.WriteFile(*outfile, []byte(hcl), 0o644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\r\n", err.Error())
 			os.Exit(1)

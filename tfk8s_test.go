@@ -23,6 +23,10 @@ func TestStripNullFields(t *testing.T) {
 				}),
 			}),
 			"nullField": cty.NullVal(cty.String),
+			"listWithNulls": cty.ListVal([]cty.Value{
+				cty.StringVal("hello"),
+				cty.NullVal(cty.DynamicPseudoType),
+			}),
 		}),
 	})
 
@@ -36,14 +40,14 @@ func TestStripNullFields(t *testing.T) {
 			"affinity": cty.ObjectVal(map[string]cty.Value{
 				"nodeAffinity": cty.ObjectVal(map[string]cty.Value{}),
 			}),
+			"listWithNulls": cty.ListVal([]cty.Value{
+				cty.StringVal("hello"),
+			}),
 		}),
 	})
 
-	// Test stripNullFields
 	result := stripNullFields(input)
-	if !result.Equals(expected).True() {
-		t.Errorf("stripNullFields: got %+v, want %+v", result, expected)
-	}
+	assert.Equal(t, expected, result)
 }
 
 func TestYAMLToHCLStripNull(t *testing.T) {
@@ -64,12 +68,6 @@ spec:
 	output, err := YAMLToTerraformResources(r, "", false, true, false, false)
 	if err != nil {
 		t.Fatalf("YAMLToTerraformResources: %v", err)
-	}
-
-	if strings.Contains(output, "requiredDuringSchedulingIgnoredDuringExecution") ||
-		strings.Contains(output, "preferredDuringSchedulingIgnoredDuringExecution") ||
-		strings.Contains(output, "nullField") {
-		t.Errorf("HCL contains null fields: %s", output)
 	}
 
 	expected := `
