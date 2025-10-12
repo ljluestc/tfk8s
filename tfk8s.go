@@ -34,7 +34,7 @@ var ignoreMetadata = []string{
 	"uid",
 	"managedFields",
 	"finalizers",
-        "generation",
+	"generation",
 }
 
 // ignoreAnnotations is the list of annotations to strip
@@ -43,41 +43,84 @@ var ignoreAnnotations = []string{
 	"kubectl.kubernetes.io/last-applied-configuration",
 }
 
-// stripServerSideFields removes fields that have been added on the
-// server side after the resource was created such as the status field
-func stripServerSideFields(doc cty.Value) cty.Value {
+var yamlSeparator = "\n---"
+
+// stripNullFields removes any field that is null
+// This is a simplified version that only processes objects and avoids list processing
+// to prevent type inconsistency issues with complex manifests like Istio
+func stripNullFields(val cty.Value) cty.Value {
+	if val.Type().IsObjectType() || val.Type().IsMapType() {
+		m := val.AsValueMap()
+		newMap := make(map[string]cty.Value)
+		for k, v := range m {
+			if !v.IsNull() {
+				// Only recursively process if it's an object/map, not lists
+				if v.Type().IsObjectType() || v.Type().IsMapType() {
+					newMap[k] = stripNullFields(v)
+				} else {
+					newMap[k] = v
+				}
+			}
+		}
+		return cty.ObjectVal(newMap)
+	}
+
+	// For lists, we only remove null elements without modifying their structure
+	if val.Type().IsListType() || val.Type().IsSetType() || val.Type().IsTupleType() {
+		slice := val.AsValueSlice()
+		newSlice := make([]cty.Value, 0)
+		for _, v := range slice {
+			if !v.IsNull() {
+				newSlice = append(newSlice, v)
+			}
+		}
+		return cty.ListVal(newSlice)
+	}
+
+	return val
+}
+
+// stripServerSideFields removes server-side fields and optionally null fields
+func stripServerSideFields(doc cty.Value, stripNull bool) cty.Value {
 	m := doc.AsValueMap()
 
-	// strip server-side metadata
-	metadata := m["metadata"].AsValueMap()
-	for _, f := range ignoreMetadata {
-		delete(metadata, f)
-	}
-	if v, ok := metadata["annotations"]; ok {
-		annotations := v.AsValueMap()
-		for _, a := range ignoreAnnotations {
-			delete(annotations, a)
+	// Strip server-side metadata (only if metadata exists and is not null)
+	if metadataVal, ok := m["metadata"]; ok && !metadataVal.IsNull() {
+		metadata := metadataVal.AsValueMap()
+		for _, f := range ignoreMetadata {
+			delete(metadata, f)
 		}
-		if len(annotations) == 0 {
-			delete(metadata, "annotations")
-		} else {
-			metadata["annotations"] = cty.ObjectVal(annotations)
+		if v, ok := metadata["annotations"]; ok && !v.IsNull() {
+			annotations := v.AsValueMap()
+			for _, a := range ignoreAnnotations {
+				delete(annotations, a)
+			}
+			if len(annotations) == 0 {
+				delete(metadata, "annotations")
+			} else {
+				metadata["annotations"] = cty.ObjectVal(annotations)
+			}
 		}
+		if ns, ok := metadata["namespace"]; ok && ns.AsString() == "default" {
+			delete(metadata, "namespace")
+		}
+		m["metadata"] = cty.ObjectVal(metadata)
 	}
-	if ns, ok := metadata["namespace"]; ok && ns.AsString() == "default" {
-		delete(metadata, "namespace")
-	}
-	m["metadata"] = cty.ObjectVal(metadata)
 
-	// strip finalizer from spec
+	// Strip finalizer from spec
 	if v, ok := m["spec"]; ok {
 		mm := v.AsValueMap()
 		delete(mm, "finalizers")
 		m["spec"] = cty.ObjectVal(mm)
 	}
 
-	// strip status field
+	// Strip status field
 	delete(m, "status")
+
+	// Strip null fields if requested
+	if stripNull {
+		return stripNullFields(cty.ObjectVal(m))
+	}
 
 	return cty.ObjectVal(m)
 }
@@ -88,16 +131,17 @@ func snakify(s string) string {
 	return strings.ToLower(re.ReplaceAllString(s, "_"))
 }
 
-// escape incidences of ${} with $${} to prevent Terraform trying to interpolate them
+// escapeShellVars converts "${}" to "$${}" to prevent Terraform interpolation
 func escapeShellVars(s string) string {
 	r := regexp.MustCompile(`(\${.*?)`)
 	return r.ReplaceAllString(s, `$$$1`)
 }
 
-// yamlToHCL converts a single YAML document Terraform HCL
+// yamlToHCL converts a single YAML document to Terraform HCL
 func yamlToHCL(
 	doc cty.Value, providerAlias string,
-	stripServerSide bool, mapOnly bool, stripKeyQuotes bool) (string, error) {
+	stripServerSide bool, stripNull bool, mapOnly bool, stripKeyQuotes bool,
+) (string, error) {
 	m := doc.AsValueMap()
 	docs := []cty.Value{doc}
 	if strings.HasSuffix(m["kind"].AsString(), "List") {
@@ -108,19 +152,24 @@ func yamlToHCL(
 	for i, doc := range docs {
 		mm := doc.AsValueMap()
 		kind := mm["kind"].AsString()
-		metadata := mm["metadata"].AsValueMap()
+		
+		var metadata map[string]cty.Value
 		var namespace string
-		if v, ok := metadata["namespace"]; ok {
-			namespace = v.AsString()
-		}
-
 		var name string
-		if n, ok := metadata["name"]; ok {
-			name = n.AsString()
-		} else if n, ok := metadata["generateName"]; ok {
-			name = n.AsString()
-			if name[len(name)-1] == '-' {
-				name = name[:len(name)-1]
+		
+		if metadataVal, ok := mm["metadata"]; ok && !metadataVal.IsNull() {
+			metadata = metadataVal.AsValueMap()
+			if v, ok := metadata["namespace"]; ok {
+				namespace = v.AsString()
+			}
+
+			if n, ok := metadata["name"]; ok {
+				name = n.AsString()
+			} else if n, ok := metadata["generateName"]; ok {
+				name = n.AsString()
+				if name[len(name)-1] == '-' {
+					name = name[:len(name)-1]
+				}
 			}
 		}
 
@@ -131,8 +180,8 @@ func yamlToHCL(
 		resourceName = resourceName + "_" + name
 		resourceName = snakify(resourceName)
 
-		if stripServerSide {
-			doc = stripServerSideFields(doc)
+		if stripServerSide || stripNull {
+			doc = stripServerSideFields(doc, stripNull)
 		}
 		s := terraform.FormatValue(doc, 0, stripKeyQuotes)
 		s = escapeShellVars(s)
@@ -155,15 +204,11 @@ func yamlToHCL(
 	return hcl, nil
 }
 
-var yamlSeparator = "\n---"
-
-// YAMLToTerraformResources takes a file containing one or more Kubernetes configs
-// and converts it to resources that can be used by the Terraform Kubernetes Provider
-//
-// FIXME this function has too many arguments now, use functional options instead
+// YAMLToTerraformResources converts YAML input to Terraform resources
 func YAMLToTerraformResources(
 	r io.Reader, providerAlias string, stripServerSide bool,
-	mapOnly bool, stripKeyQuotes bool) (string, error) {
+	stripNull bool, mapOnly bool, stripKeyQuotes bool,
+) (string, error) {
 	hcl := ""
 
 	buf := bytes.Buffer{}
@@ -206,7 +251,7 @@ func YAMLToTerraformResources(
 			return "", fmt.Errorf("the manifest must be a YAML document")
 		}
 
-		formatted, err := yamlToHCL(doc, providerAlias, stripServerSide, mapOnly, stripKeyQuotes)
+		formatted, err := yamlToHCL(doc, providerAlias, stripServerSide, stripNull, mapOnly, stripKeyQuotes)
 		if err != nil {
 			return "", fmt.Errorf("error converting YAML to HCL: %s", err)
 		}
@@ -242,9 +287,10 @@ func main() {
 	outfile := flag.StringP("output", "o", "-", "Output file to write Terraform config")
 	providerAlias := flag.StringP("provider", "p", "", "Provider alias to populate the `provider` attribute")
 	stripServerSide := flag.BoolP("strip", "s", false, "Strip out server side fields - use if you are piping from kubectl get")
-	version := flag.BoolP("version", "V", false, "Show tool version")
+	stripNull := flag.BoolP("strip-null", "n", false, "Strip out fields with null values")
 	mapOnly := flag.BoolP("map-only", "M", false, "Output only an HCL map structure")
 	stripKeyQuotes := flag.BoolP("strip-key-quotes", "Q", false, "Strip out quotes from HCL map keys unless they are required.")
+	version := flag.BoolP("version", "V", false, "Show tool version")
 	flag.Parse()
 
 	if *version {
@@ -262,10 +308,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %s\r\n", err.Error())
 			os.Exit(1)
 		}
+		defer file.Close()
 	}
 
-	hcl, err := YAMLToTerraformResources(
-		file, *providerAlias, *stripServerSide, *mapOnly, *stripKeyQuotes)
+	hcl, err := YAMLToTerraformResources(file, *providerAlias, *stripServerSide, *stripNull, *mapOnly, *stripKeyQuotes)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\r\n", err.Error())
 		os.Exit(1)
@@ -274,7 +320,7 @@ func main() {
 	if *outfile == "-" {
 		fmt.Print(hcl)
 	} else {
-		err := os.WriteFile(*outfile, []byte(hcl), 0644)
+		err := os.WriteFile(*outfile, []byte(hcl), 0o644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\r\n", err.Error())
 			os.Exit(1)
