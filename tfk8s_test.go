@@ -414,21 +414,70 @@ metadata:
   uid: bea6500b-0637-4d2d-b726-e0bda0b595dd`
 
 	r := strings.NewReader(yaml)
-	output, err := YAMLToTerraformResources(r, "", true, true, false, false)
+	output, err := YAMLToTerraformResources(r, "", true, false, true, false)
 	if err != nil {
 		t.Fatal("Converting to HCL failed:", err)
 	}
 
+	expected := `{
+  "apiVersion" = "v1"
+  "data" = {
+    "TEST" = "test"
+  }
+  "kind" = "ConfigMap"
+  "metadata" = {
+    "name" = "test"
+  }
+}`
+	assert.Equal(t, strings.TrimSpace(expected), strings.TrimSpace(output))
+}
+
+func TestYAMLToHCLIstioOperatorStripNull(t *testing.T) {
+	yamlInput := `
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: demo-profile
+spec:
+  profile: demo
+  components:
+    ingressGateways:
+    - name: istio-ingressgateway
+      enabled: false
+    egressGateways:
+    - name: istio-egressgateway
+      enabled: false
+`
+	r := strings.NewReader(yamlInput)
+	output, err := YAMLToTerraformResources(r, "", false, true, false, false)
+	if err != nil {
+		t.Fatalf("YAMLToTerraformResources: %v", err)
+	}
+
 	expected := `
-resource "kubernetes_manifest" "configmap_test" {
+resource "kubernetes_manifest" "istiooperator_demo_profile" {
   manifest = {
-    "apiVersion" = "v1"
-    "data" = {
-      "TEST" = "test"
-    }
-    "kind" = "ConfigMap"
+    "apiVersion" = "install.istio.io/v1alpha1"
+    "kind" = "IstioOperator"
     "metadata" = {
-      "name" = "test"
+      "name" = "demo-profile"
+    }
+    "spec" = {
+      "components" = {
+        "egressGateways" = tolist([
+          {
+            "enabled" = false
+            "name" = "istio-egressgateway"
+          },
+        ])
+        "ingressGateways" = tolist([
+          {
+            "enabled" = false
+            "name" = "istio-ingressgateway"
+          },
+        ])
+      }
+      "profile" = "demo"
     }
   }
 }`
