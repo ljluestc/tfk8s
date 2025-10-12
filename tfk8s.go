@@ -25,6 +25,8 @@ var toolVersion string
 // resourceType is the type of Terraform resource
 var resourceType = "kubernetes_manifest"
 
+// ignoreMetadata is the list of metadata fields to strip
+// when --strip is supplied
 var ignoreMetadata = []string{
 	"creationTimestamp",
 	"resourceVersion",
@@ -35,6 +37,8 @@ var ignoreMetadata = []string{
 	"generation",
 }
 
+// ignoreAnnotations is the list of annotations to strip
+// when --strip is supplied
 var ignoreAnnotations = []string{
 	"kubectl.kubernetes.io/last-applied-configuration",
 }
@@ -208,6 +212,7 @@ func YAMLToTerraformResources(
 	docs := strings.Split(manifest, yamlSeparator)
 	for _, doc := range docs {
 		if strings.TrimSpace(doc) == "" {
+			// some manifests have empty documents
 			continue
 		}
 
@@ -228,6 +233,7 @@ func YAMLToTerraformResources(
 		}
 
 		if doc.IsNull() {
+			// skip empty YAML docs
 			continue
 		}
 
@@ -270,10 +276,10 @@ func main() {
 	infile := flag.StringP("file", "f", "-", "Input file containing Kubernetes YAML manifests")
 	outfile := flag.StringP("output", "o", "-", "Output file to write Terraform config")
 	providerAlias := flag.StringP("provider", "p", "", "Provider alias to populate the `provider` attribute")
-	stripServerSide := flag.BoolP("strip", "s", false, "Strip out server-side fields")
+	stripServerSide := flag.BoolP("strip", "s", false, "Strip out server side fields - use if you are piping from kubectl get")
 	stripNull := flag.BoolP("strip-null", "n", false, "Strip out fields with null values")
 	mapOnly := flag.BoolP("map-only", "M", false, "Output only an HCL map structure")
-	stripKeyQuotes := flag.BoolP("strip-key-quotes", "Q", false, "Strip out quotes from HCL map keys unless required")
+	stripKeyQuotes := flag.BoolP("strip-key-quotes", "Q", false, "Strip out quotes from HCL map keys unless they are required.")
 	version := flag.BoolP("version", "V", false, "Show tool version")
 	flag.Parse()
 
